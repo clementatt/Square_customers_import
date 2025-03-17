@@ -156,7 +156,7 @@ class SquareCustomerImport:
     def create_customers_batch(self, customers_data, group_id):
         """批量创建客户"""
         try:
-            batch_size = 300
+            batch_size = 100
             total_success = 0
             total_failed = 0
             all_responses = {}
