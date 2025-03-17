@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 排除的Python脚本
+create_test_data.py
+square_customer_cleanup.py
+
+# 环境文件
+.env
+.venv
+env/
+venv/
+ENV/
+
+# 日志文件
+logs/
+*.log
+
+# IDE配置
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 系统文件
+.DS_Store
+Thumbs.db
