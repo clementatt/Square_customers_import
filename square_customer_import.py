@@ -26,8 +26,12 @@ class SquareCustomerImport:
         # 确保logs文件夹存在
         os.makedirs('logs', exist_ok=True)
         
+        # 获取环境变量中的日志级别，默认为INFO
+        log_level_name = os.getenv('LOG_LEVEL', 'INFO')
+        log_level = getattr(logging, log_level_name, logging.INFO)
+        
         logging.basicConfig(
-            level=logging.INFO,
+            level=log_level,
             format='%(asctime)s - %(levelname)s - %(message)s',
             handlers=[
                 logging.FileHandler(f'logs/import_log_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'),
@@ -35,6 +39,7 @@ class SquareCustomerImport:
             ]
         )
         self.logger = logging.getLogger(__name__)
+        self.logger.info(f'日志级别设置为: {log_level_name}')
     
     def format_phone_number(self, phone):
         """格式化电话号码，仅在国际区号前添加加号"""
@@ -71,16 +76,53 @@ class SquareCustomerImport:
     def read_file(self, file_path):
         """读取客户数据文件（支持CSV和Excel格式）"""
         customers = []
+        total_records = 0
+        success_week_parse = 0
+        failed_week_parse = 0
         try:
             file_ext = os.path.splitext(file_path)[1].lower()
+            self.logger.info(f'开始读取{file_ext}格式文件: {file_path}')
+            
             if file_ext == '.csv':
                 with open(file_path, 'r', encoding='utf-8') as file:
                     reader = csv.DictReader(file)
-                    for row in reader:
+                    for row_index, row in enumerate(reader, 1):
+                        total_records += 1
+                        # 处理客户姓名
+                        name_parts = self.process_name(str(row.get('Customer name', '')))
+                        row['given_name'] = name_parts['given_name']
+                        row['family_name'] = name_parts['family_name']
+                        
+                        # 处理电话号码
+                        if 'Customer phone number' in row:
+                            row['phone_number'] = self.format_phone_number(row.get('Customer phone number', ''))
+                        
+                        # 处理Pick-up time并添加周数信息
+                        if 'Pick-up time (local)' in row and row['Pick-up time (local)']:
+                            try:
+                                pickup_time_str = str(row['Pick-up time (local)']).strip()
+                                pickup_time = datetime.strptime(pickup_time_str, '%Y-%m-%d %H:%M:%S')
+                                # 获取ISO周数（1-53）
+                                week_number = pickup_time.isocalendar()[1]
+                                row['week_number'] = week_number
+                                success_week_parse += 1
+                                self.logger.debug(f"记录 {row_index}: 成功解析Pick-up time '{pickup_time_str}', 周数={week_number}")
+                            except (ValueError, TypeError) as e:
+                                self.logger.warning(f"记录 {row_index}: 无法解析Pick-up time: '{row.get('Pick-up time (local)', '')}', 错误: {str(e)}")
+                                row['week_number'] = 0
+                                failed_week_parse += 1
+                        else:
+                            self.logger.warning(f"记录 {row_index}: 缺少Pick-up time字段或值为空")
+                            row['week_number'] = 0
+                            failed_week_parse += 1
                         customers.append(row)
             elif file_ext in ['.xlsx', '.xls']:
                 df = pd.read_excel(file_path)
-                for _, row in df.iterrows():
+                total_records = len(df)
+                self.logger.info(f'Excel文件共有 {total_records} 条记录')
+                
+                for row_index, row_data in enumerate(df.iterrows(), 1):
+                    _, row = row_data  # pandas返回(index, Series)元组
                     name_parts = self.process_name(str(row.get('Customer name', '')))
                     customer = {
                         'given_name': name_parts['given_name'],
@@ -88,9 +130,31 @@ class SquareCustomerImport:
                         'email_address': str(row.get('Customer email', '')),
                         'phone_number': self.format_phone_number(row.get('Customer phone number', ''))
                     }
+                    
+                    # 处理Pick-up time并添加周数信息
+                    if 'Pick-up time (local)' in row and not pd.isna(row['Pick-up time (local)']):
+                        try:
+                            pickup_time_str = str(row['Pick-up time (local)']).strip()
+                            pickup_time = datetime.strptime(pickup_time_str, '%Y-%m-%d %H:%M:%S')
+                            # 获取ISO周数（1-53）
+                            week_number = pickup_time.isocalendar()[1]
+                            customer['week_number'] = week_number
+                            success_week_parse += 1
+                            self.logger.debug(f"记录 {row_index}: 成功解析Pick-up time '{pickup_time_str}', 周数={week_number}")
+                        except (ValueError, TypeError) as e:
+                            self.logger.warning(f"记录 {row_index}: 无法解析Pick-up time: '{row.get('Pick-up time (local)', '')}', 错误: {str(e)}")
+                            customer['week_number'] = 0
+                            failed_week_parse += 1
+                    else:
+                        self.logger.warning(f"记录 {row_index}: 缺少Pick-up time字段或值为空")
+                        customer['week_number'] = 0
+                        failed_week_parse += 1
+                    
                     customers.append(customer)
             else:
                 raise ValueError(f'不支持的文件格式: {file_ext}')
+                
+            self.logger.info(f'文件读取完成: 总记录数={total_records}, 成功解析周数={success_week_parse}, 失败={failed_week_parse}')
             return customers
         except Exception as e:
             self.logger.error(f'读取文件失败: {str(e)}')
@@ -242,6 +306,81 @@ class SquareCustomerImport:
             self.logger.error(f'批量创建客户失败: {str(e)}')
             return False, str(e)
 
+    def check_duplicate_in_group(self, phone_number, group_customers):
+        """检查手机号在同一周客户组内是否重复
+        
+        Args:
+            phone_number: 要检查的手机号
+            group_customers: 同一周的客户列表
+            
+        Returns:
+            如果手机号在组内重复返回True，否则返回False
+        """
+        if not phone_number or not group_customers:
+            return False
+        
+        self.logger.debug(f'检查手机号 {phone_number} 是否在组内重复')
+            
+        # 遍历组内所有客户，检查手机号是否重复
+        for customer in group_customers:
+            customer_phone = customer.get('phone_number')
+            if customer_phone and customer_phone == phone_number:
+                self.logger.debug(f'发现重复手机号: {phone_number}')
+                return True
+        return False
+    
+    def get_customers_in_group(self, group_id):
+        """获取客户组内的所有客户
+        
+        Args:
+            group_id: 客户组ID
+            
+        Returns:
+            客户组内的客户列表，如果出错则返回空列表
+        """
+        try:
+            self.logger.info(f'正在获取客户组 {group_id} 内的客户...')
+            all_customers = []
+            cursor = None
+            page_limit = 100  # Square API限制每页最多100条记录
+            
+            # 使用分页查询获取所有客户
+            while True:
+                # 构建查询
+                query = {
+                    'query': {
+                        'filter': {
+                            'group_ids': {'any': [group_id]}
+                        }
+                    },
+                    'limit': page_limit
+                }
+                
+                # 添加游标用于分页
+                if cursor:
+                    query['cursor'] = cursor
+                
+                result = self.client.customers.search_customers(body=query)
+                
+                if result.is_success():
+                    page_customers = result.body.get('customers', [])
+                    all_customers.extend(page_customers)
+                    self.logger.info(f'已获取 {len(all_customers)} 个客户')
+                    
+                    # 检查是否有更多页
+                    cursor = result.body.get('cursor')
+                    if not cursor:
+                        break
+                else:
+                    self.logger.error(f'获取客户组内客户失败: {result.errors}')
+                    return []
+            
+            self.logger.info(f'成功获取客户组内的 {len(all_customers)} 个客户')
+            return all_customers
+        except Exception as e:
+            self.logger.error(f'获取客户组内客户时发生错误: {str(e)}')
+            return []
+    
     def import_customers(self, file_path):
         """导入客户数据的主要流程"""
         customers = self.read_file(file_path)
@@ -254,12 +393,7 @@ class SquareCustomerImport:
         failed = 0
         valid_customers = []
         
-        # 创建客户组
-        group_name = datetime.now().strftime('%y/%m/%d_%H:%M_自动导入')
-        group_id = self.create_customer_group(group_name)
-        if not group_id:
-            self.logger.error('创建客户群组失败，导入过程终止')
-            return
+        self.logger.info(f'开始验证{total}个客户数据...')
         
         # 创建验证进度条
         validate_pbar = tqdm(total=total, desc='验证进度', unit='客户')
@@ -278,15 +412,160 @@ class SquareCustomerImport:
         validate_pbar.close()
         
         if valid_customers:
-            self.logger.info(f'开始批量导入 {len(valid_customers)} 个有效客户...')
-            is_success, result = self.create_customers_batch(valid_customers, group_id)
+            # 按周数对客户进行分组
+            customers_by_week = {}
+            week_stats = {}
             
-            if is_success:
-                success = len(valid_customers)
-                self.logger.info('批量导入成功')
-            else:
-                failed += len(valid_customers)
-                self.logger.error(f'批量导入失败: {result}')
+            self.logger.info('开始按周数分组客户数据...')
+            for customer in valid_customers:
+                week_number = customer.get('week_number', 0)
+                if week_number not in customers_by_week:
+                    customers_by_week[week_number] = []
+                    week_stats[week_number] = {'total': 0, 'valid_week': 0, 'invalid_week': 0}
+                
+                customers_by_week[week_number].append(customer)
+                week_stats[week_number]['total'] += 1
+                
+                if week_number > 0:
+                    week_stats[week_number]['valid_week'] += 1
+                else:
+                    week_stats[week_number]['invalid_week'] += 1
+            
+            # 输出每个周的统计信息
+            for week_number, stats in week_stats.items():
+                if week_number == 0:
+                    week_name = "未知周数"
+                else:
+                    week_name = f"第{week_number}周"
+                    
+                self.logger.info(f'{week_name}客户统计: 总数={stats["total"]}, 有效周数={stats["valid_week"]}, 无效周数={stats["invalid_week"]}')
+            
+            total_success = 0
+            total_failed = 0
+            
+            # 为每个周创建一个客户组并导入客户
+            for week_number, week_customers in customers_by_week.items():
+                if week_number == 0:
+                    group_name = "未知周数_客户组"
+                else:
+                    current_year = datetime.now().year
+                    group_name = f"{current_year}年第{week_number}周_客户组"
+                
+                self.logger.info(f'为{group_name}的{len(week_customers)}个客户创建群组...')
+                group_id = self.create_customer_group(group_name)
+                
+                if not group_id:
+                    self.logger.error(f'创建{group_name}客户群组失败，跳过该批次')
+                    total_failed += len(week_customers)
+                    continue
+                
+                # 获取组内现有客户，用于手机号查重
+                existing_customers = self.get_customers_in_group(group_id)
+                self.logger.info(f'获取到{group_name}客户组内现有客户 {len(existing_customers)} 个')
+                
+                # 在同一周内进行手机号查重
+                deduplicated_customers = []
+                duplicate_count = 0
+                processed_phones = set()
+                
+                # 将现有客户的手机号添加到已处理集合中
+                for existing_customer in existing_customers:
+                    phone = existing_customer.get('phone_number')
+                    if phone:
+                        processed_phones.add(phone)
+                        self.logger.debug(f'添加现有客户手机号到查重集合: {phone}')
+                
+                for customer in week_customers:
+                    phone_number = customer.get('phone_number')
+                    if phone_number and phone_number in processed_phones:
+                        self.logger.warning(f'在{group_name}内发现重复手机号: {phone_number}，跳过该客户')
+                        duplicate_count += 1
+                        continue
+                    
+                    if phone_number:
+                        processed_phones.add(phone_number)
+                    deduplicated_customers.append(customer)
+                
+                if duplicate_count > 0:
+                    self.logger.info(f'{group_name}内检测到{duplicate_count}个重复手机号客户，已跳过')
+                
+                self.logger.info(f'开始批量导入{group_name}的{len(deduplicated_customers)}个客户...')
+                is_success, result = self.create_customers_batch(deduplicated_customers, group_id)
+                
+                if is_success:
+                    total_success += len(deduplicated_customers)
+                    self.logger.info(f'{group_name}客户批量导入成功')
+                else:
+                    total_failed += len(deduplicated_customers)
+                    self.logger.error(f'{group_name}客户批量导入失败: {result}')
+            
+            success = total_success
+            failed = total_failed
+            
+            # 添加每周导入数据的详细统计
+            self.logger.info('='*50)
+            self.logger.info('每周导入数据统计汇总:')
+            self.logger.info('-'*50)
+            
+            # 创建每周统计数据字典
+            week_import_stats = {}
+            for week_number in customers_by_week.keys():
+                week_import_stats[week_number] = {
+                    'total': len(customers_by_week[week_number]),
+                    'success': 0,
+                    'skipped': 0
+                }
+            
+            # 遍历每个周的统计信息
+            for week_number, stats in sorted(week_import_stats.items()):
+                if week_number == 0:
+                    week_name = "未知周数"
+                else:
+                    week_name = f"第{week_number}周"
+                
+                # 计算成功和跳过的数量
+                total_in_week = stats['total']
+                skipped_in_week = 0
+                
+                # 获取该周的客户组名称
+                if week_number == 0:
+                    group_name = "未知周数_客户组"
+                else:
+                    current_year = datetime.now().year
+                    group_name = f"{current_year}年第{week_number}周_客户组"
+                
+                # 查找该周的重复数据数量
+                for week_num, week_customers in customers_by_week.items():
+                    if week_num == week_number:
+                        # 计算该周内被跳过的重复客户数量
+                        original_count = len(week_customers)
+                        # 获取该周的去重后客户数量
+                        deduplicated_count = 0
+                        processed_phones = set()
+                        
+                        # 模拟去重过程来计算跳过的数量
+                        for customer in week_customers:
+                            phone_number = customer.get('phone_number')
+                            if phone_number and phone_number in processed_phones:
+                                skipped_in_week += 1
+                            else:
+                                if phone_number:
+                                    processed_phones.add(phone_number)
+                                deduplicated_count += 1
+                
+                # 计算成功导入的数量
+                success_in_week = total_in_week - skipped_in_week
+                
+                # 更新统计信息
+                week_import_stats[week_number]['success'] = success_in_week
+                week_import_stats[week_number]['skipped'] = skipped_in_week
+                
+                # 输出该周的统计信息
+                self.logger.info(f'{week_name}客户导入统计: 总数={total_in_week}, 成功导入={success_in_week}, 跳过重复={skipped_in_week}')
+            
+            self.logger.info('-'*50)
+            self.logger.info(f'总计: 成功导入 {success} 个, 失败 {failed} 个')
+            self.logger.info('='*50)
         
         self.logger.info(f'导入完成: 成功 {success} 个, 失败 {failed} 个')
 
@@ -300,6 +579,12 @@ class SquareCustomerImport:
             成功返回群组ID，失败返回None
         """
         try:
+            # 检查是否已存在同名群组
+            existing_group_id = self.find_customer_group_by_name(group_name)
+            if existing_group_id:
+                self.logger.info(f'找到已存在的客户群组: {group_name} (ID: {existing_group_id})')
+                return existing_group_id
+            
             # 使用群组名称作为幂等性键的一部分，确保相同名称的群组不会重复创建
             idempotency_key = f"{group_name}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
             
@@ -326,6 +611,28 @@ class SquareCustomerImport:
                 return None
         except Exception as e:
             self.logger.error(f'创建客户群组时发生错误: {str(e)}')
+            return None
+            
+    def find_customer_group_by_name(self, group_name):
+        """根据名称查找客户群组
+        
+        Args:
+            group_name: 群组名称
+            
+        Returns:
+            找到返回群组ID，未找到返回None
+        """
+        try:
+            result = self.client.customer_groups.list_customer_groups()
+            
+            if result.is_success():
+                groups = result.body.get('groups', [])
+                for group in groups:
+                    if group.get('name') == group_name:
+                        return group.get('id')
+            return None
+        except Exception as e:
+            self.logger.warning(f'查找客户群组时发生错误: {str(e)}')
             return None
 
     def add_customers_to_group(self, group_id, customer_ids):
@@ -398,10 +705,15 @@ class SquareCustomerImport:
             return False
 
 def main():
-    # 从环境变量获取Square访问令牌
-    access_token = os.getenv('SQUARE_ACCESS_TOKEN')
+    # 根据环境获取对应的访问令牌
+    environment = os.getenv('SQUARE_ENVIRONMENT', 'sandbox')
+    if environment == 'sandbox':
+        access_token = os.getenv('SQUARE_SANDBOX_ACCESS_TOKEN')
+    else:
+        access_token = os.getenv('SQUARE_PRODUCTION_ACCESS_TOKEN')
+    
     if not access_token:
-        print('错误: 未设置SQUARE_ACCESS_TOKEN环境变量')
+        print(f'错误: 未设置{environment}环境的访问令牌')
         sys.exit(1)
     
     while True:

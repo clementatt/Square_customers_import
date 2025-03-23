@@ -9,6 +9,7 @@ square_customer_cleanup.py
 
 # 环境文件
 .env
+.env.production
 .venv
 env/
 venv/

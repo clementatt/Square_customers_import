@@ -8,6 +8,7 @@ This is a Python toolkit for managing Square customer data, featuring customer d
   - Support CSV and Excel (xlsx/xls) format data files
   - Support customer group management for easy classification and batch operations
   - Automatic detection and handling of duplicate customer data
+  - Phone number deduplication within the same week to avoid duplicate imports
 - **Progress Display**: Real-time progress bar display
   - Show overall progress and current batch progress
   - Real-time update of success/failure count statistics
@@ -65,6 +66,7 @@ importer.import_customers('customers.xlsx')
   - `Customer name`: Customer's name (format: surname/given name or full name)
   - `Customer email`: Customer's email
   - `Customer phone number`: Customer's phone (optional, international code will be added automatically)
+  - `Pick-up time (local)`: Pick-up time (format: YYYY-MM-DD HH:MM:SS), used for grouping customers by week
 
 ### Customer Group Management
 

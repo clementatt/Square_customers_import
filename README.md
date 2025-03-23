@@ -10,6 +10,7 @@
   - 支持 CSV 和 Excel (xlsx/xls) 格式的数据文件
   - 支持客户群组管理，便于分类和批量操作
   - 自动检测和处理重复客户数据
+  - 同一周内手机号查重功能，避免重复导入
 - **进度显示**：使用进度条实时显示操作进度
   - 显示总体进度和当前批次进度
   - 实时更新成功/失败数量统计
@@ -67,15 +68,18 @@ importer.import_customers('customers.xlsx')
   - `Customer name`：客户姓名（格式：姓/名 或 完整名字）
   - `Customer email`：客户邮箱
   - `Customer phone number`：客户电话（可选，自动添加国际区号）
+  - `Pick-up time (local)`：送达时间（格式：YYYY-MM-DD HH:MM:SS），用于按周分组客户
 
 ### 客户群组管理
 
-可以在导入时指定客户群组，方便后续管理：
+系统会根据客户数据中的`Pick-up time (local)`字段自动计算周数，并按周数创建不同的客户组：
 
 ```python
-# 导入客户数据并指定群组
-importer.import_customers('customers.csv', group_name='VIP客户')
+# 导入客户数据，系统会自动按周数分组
+importer.import_customers('customers.csv')
 ```
+
+每个客户组的命名格式为：`YYYY年第W周_客户组`，其中YYYY为当前年份，W为ISO周数（1-53）。
 
 ## 进度显示
 
